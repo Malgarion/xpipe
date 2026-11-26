@@ -136,7 +136,8 @@ static void transfer_job_io(struct job *job, int input, int output){
 	}
 }
 //==============================================================================================================
-static bool run_job(struct job *job, char **command, const posix_spawnattr_t *attributes) {
+static int spawn_command(char **command, const posix_spawnattr_t *attributes,
+			 pid_t *child, int *child_input, int *child_output) {
 	int input[2], output[2];
 	if (pipe2(input, O_CLOEXEC) < 0) die("create stdin pipe", errno);
 	if (pipe2(output, O_CLOEXEC) < 0) die("create stdout pipe", errno);
@@ -147,27 +148,240 @@ static bool run_job(struct job *job, char **command, const posix_spawnattr_t *at
 	check(posix_spawn_file_actions_adddup2(&actions, input[0], STDIN_FILENO), "redirect command stdin");
 	check(posix_spawn_file_actions_adddup2(&actions, output[1], STDOUT_FILENO), "redirect command stdout");
 
-	pid_t child;
-	int error = posix_spawnp(&child, command[0], &actions, attributes, command, environ);
+	int error = posix_spawnp(child, command[0], &actions, attributes, command, environ);
 	posix_spawn_file_actions_destroy(&actions);
 	close(input[0]);
 	close(output[1]);
 	if (error) {
 		close(input[1]);
 		close(output[0]);
-		fprintf(stderr, "xpipe: %s: %s\n", command[0], strerror(error));
-		return false;
+		return error;
 	}
-	transfer_job_io(job, input[1], output[0]);
-
+	*child_input = input[1];
+	*child_output = output[0];
+	return 0;
+}
+//==============================================================================================================
+static bool wait_command(pid_t child, const char *command, bool report) {
 	int status;
 	while (waitpid(child, &status, 0) < 0) if (errno != EINTR) die("wait for command", errno);
 
-	if (WIFSIGNALED(status)) 
-		fprintf(stderr, "xpipe: %s terminated by signal %d\n", command[0], WTERMSIG(status));
-	else if (WEXITSTATUS(status))
-		fprintf(stderr, "xpipe: %s exited with status %d\n", command[0], WEXITSTATUS(status));
+	if (report && WIFSIGNALED(status))
+		fprintf(stderr, "xpipe: %s terminated by signal %d\n", command, WTERMSIG(status));
+	else if (report && WIFEXITED(status) && WEXITSTATUS(status))
+		fprintf(stderr, "xpipe: %s exited with status %d\n", command, WEXITSTATUS(status));
 	return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+//==============================================================================================================
+static bool run_job(struct job *job, char **command, const posix_spawnattr_t *attributes) {
+	pid_t child;
+	int input, output;
+	int error = spawn_command(command, attributes, &child, &input, &output);
+	if (error) {
+		fprintf(stderr, "xpipe: %s: %s\n", command[0], strerror(error));
+		return false;
+	}
+	transfer_job_io(job, input, output);
+	return wait_command(child, command[0], true);
+}
+//==============================================================================================================
+struct process_worker {
+	pid_t pid;
+	char *input, *output;
+	size_t input_length, input_capacity, sent;
+	size_t output_length, output_capacity;
+};
+//==============================================================================================================
+static int emit_worker_lines(struct process_worker *worker, const char *data,
+			      size_t length, bool eof, bool *needs_separator) {
+	// Only the new bytes can contain a newline. The saved prefix is partial.
+	size_t complete = length;
+	while (complete && data[complete - 1] != '\n') --complete;
+
+	if (complete || (eof && worker->output_length)) {
+		int error = *needs_separator ? write_all(STDOUT_FILENO, "\n", 1) : 0;
+		if (!error) error = write_all(STDOUT_FILENO, worker->output, worker->output_length);
+		if (!error) error = write_all(STDOUT_FILENO, data, complete);
+		if (error) return error;
+		*needs_separator = !complete;
+		worker->output_length = 0;
+	}
+	if (length > complete)
+		append_bytes(&worker->output, &worker->output_length, &worker->output_capacity,
+			     data + complete, length - complete);
+	return 0;
+}
+//==============================================================================================================
+static int stream_workers(char **command, size_t count, size_t lines,
+			  const posix_spawnattr_t *attributes) {
+	char input[65536], output[65536];
+	ssize_t received;
+	do {
+		received = read(STDIN_FILENO, input, sizeof input);
+	} while (received < 0 && errno == EINTR);
+	if (received < 0) die("read stdin", errno);
+	if (!received) return 0;
+
+	if (count > (SIZE_MAX - 1) / 2) die("too many workers", EOVERFLOW);
+	size_t nfds = 2 * count + 1;
+	struct pollfd *fds = calloc(nfds, sizeof *fds);
+	struct process_worker *workers = calloc(count, sizeof *workers);
+	if (!fds || !workers) die("allocate process workers", ENOMEM);
+	for (size_t i = 0; i < nfds; ++i) fds[i].fd = -1;
+
+	const char *operation = NULL;
+	int error = 0, result = 0;
+	bool eof = false;
+	size_t started = 0;
+	for (; started < count; ++started) {
+		struct pollfd *in = &fds[1 + 2 * started], *out = in + 1;
+		error = spawn_command(command, attributes, &workers[started].pid, &in->fd, &out->fd);
+		if (error) {
+			fprintf(stderr, "xpipe: failed to run command '%s': %s\n", command[0], strerror(error));
+			result = error == ENOENT ? 127 : 126;
+			goto cleanup;
+		}
+		out->events = POLLIN;
+	}
+
+	size_t offset = 0, next = 0, batch_lines = 0, target = count, outputs = count;
+	bool needs_separator = false;
+	size_t available = (size_t)received;
+	for (;;) {
+		while (offset < available) {
+			if (target == count) {
+				// Dispatch a complete batch to the next worker with room.
+				for (size_t examined = 0; examined < count; ++examined) {
+					size_t i = next;
+					next = (next + 1) % count;
+					if (!workers[i].input_length && fds[1 + 2 * i].fd >= 0) {
+						target = i;
+						break;
+					}
+				}
+				if (target == count) break;
+			}
+
+			struct process_worker *worker = &workers[target];
+			const char *start = input + offset;
+			const char *newline = memchr(start, '\n', available - offset);
+			size_t length = newline ? (size_t)(newline - start) + 1 : available - offset;
+			append_bytes(&worker->input, &worker->input_length, &worker->input_capacity,
+				     start, length);
+			offset += length;
+			if (newline && ++batch_lines == lines) {
+				fds[1 + 2 * target].events = POLLOUT;
+				target = count;
+				batch_lines = 0;
+			}
+		}
+
+		if (eof && target < count) {
+			fds[1 + 2 * target].events = POLLOUT;
+			target = count;
+		}
+		bool accepting_input = false;
+		for (size_t i = 0; i < count; ++i) {
+			struct pollfd *in = &fds[1 + 2 * i];
+			if (in->fd < 0) continue;
+			if (eof && !workers[i].input_length) close_poll_fd(in);
+			else accepting_input = true;
+		}
+		if (!accepting_input && offset < available) {
+			operation = "all workers closed stdin with input pending";
+			error = EPIPE;
+			goto cleanup;
+		}
+		if (eof && !accepting_input && !outputs) break;
+		fds[0].fd = !eof && offset == available ? STDIN_FILENO : -1;
+		fds[0].events = POLLIN;
+		if (poll(fds, nfds, -1) < 0) {
+			if (errno == EINTR) continue;
+			operation = "poll worker pipes";
+			error = errno;
+			goto cleanup;
+		}
+
+		for (size_t i = 0; i < count; ++i) {
+			struct process_worker *worker = &workers[i];
+			struct pollfd *in = &fds[1 + 2 * i], *out = in + 1;
+			if (out->revents) {
+				ssize_t size = read(out->fd, output, sizeof output);
+				if (size < 0 && errno != EINTR) {
+					operation = "read worker stdout";
+					error = errno;
+					goto cleanup;
+				}
+				if (size >= 0) {
+					error = emit_worker_lines(worker, output, (size_t)size,
+								  size == 0, &needs_separator);
+					if (error) {
+						operation = "write stdout";
+						goto cleanup;
+					}
+					if (!size) {
+						close_poll_fd(out);
+						--outputs;
+					}
+				}
+			}
+			if (in->revents & (POLLERR | POLLHUP | POLLNVAL)) {
+				if (worker->input_length) {
+					operation = "worker closed stdin with input pending";
+					error = EPIPE;
+					goto cleanup;
+				}
+				close_poll_fd(in);
+			} else if (in->revents & POLLOUT) {
+				ssize_t size = write(in->fd, worker->input + worker->sent,
+						     worker->input_length - worker->sent);
+				if (size < 0 && errno != EINTR && errno != EAGAIN) {
+					operation = "write worker stdin";
+					error = errno;
+					goto cleanup;
+				}
+				if (size > 0) worker->sent += (size_t)size;
+				if (worker->sent == worker->input_length) {
+					in->events = 0;
+					worker->sent = worker->input_length = 0;
+					if (eof) close_poll_fd(in);
+				}
+			}
+		}
+		if (fds[0].revents) {
+			received = read(STDIN_FILENO, input, sizeof input);
+			if (received < 0) {
+				if (errno == EINTR || errno == EAGAIN) continue;
+				operation = "read stdin";
+				error = errno;
+				goto cleanup;
+			}
+			eof = received == 0;
+			available = (size_t)received;
+			offset = 0;
+		}
+	}
+
+cleanup:
+	if (operation) {
+		fprintf(stderr, "xpipe: %s: %s\n", operation, strerror(error));
+		result = EXIT_FAILURE;
+	}
+	for (size_t i = 0; i < started; ++i) {
+		struct pollfd *in = &fds[1 + 2 * i], *out = in + 1;
+		if (in->fd >= 0) close_poll_fd(in);
+		if (out->fd >= 0) close_poll_fd(out);
+		if (error) kill(workers[i].pid, SIGKILL);
+	}
+	for (size_t i = 0; i < started; ++i) {
+		if (!wait_command(workers[i].pid, command[0], !error) && !result)
+			result = EXIT_FAILURE;
+		free(workers[i].input);
+		free(workers[i].output);
+	}
+	free(workers);
+	free(fds);
+	return result;
 }
 //==============================================================================================================
 static void enqueue_output(struct state *state, struct job *job) {
@@ -268,10 +482,11 @@ static struct job *read_batch(size_t lines, char **line, size_t *line_capacity, 
 }
 //==============================================================================================================
 static void usage(FILE *stream) {
-	fputs("Usage: xpipe [-j N] [-L N] [-o] command [args ...]\n"
+	fputs("Usage: xpipe [-j N] [-L N] [-o | -w] command [args ...]\n"
 		"  -j N  Concurrent jobs (default: core_count)\n"
 		"  -L N  Input lines per job (default: 1)\n"
-		"  -o    Emit job output in input order\n", stream);
+		"  -o    Emit job output in input order\n"
+		"  -w    Reuse command processes and merge complete stdout lines\n", stream);
 }
 //==============================================================================================================
 int main(int argc, char **argv) {
@@ -282,8 +497,9 @@ int main(int argc, char **argv) {
 		.slot_ready = PTHREAD_COND_INITIALIZER
 	};
 	size_t lines = 1;
+	bool persistent = false;
 	int option;
-	while ((option = getopt(argc, argv, "+j:L:oh")) != -1) {
+	while ((option = getopt(argc, argv, "+j:L:owh")) != -1) {
 		switch (option) {
 			case 'j':
 				state.limit = positive_number(optarg);
@@ -295,6 +511,9 @@ int main(int argc, char **argv) {
 				break;
 			case 'o':
 				state.ordered = true;
+				continue;
+			case 'w':
+				persistent = true;
 				continue;
 			case 'h':
 				usage(stdout);
@@ -308,20 +527,16 @@ int main(int argc, char **argv) {
 		return 2;
 	}
 
+	if (persistent && state.ordered) {
+		fputs("xpipe: -w cannot be combined with -o\n", stderr);
+		return 2;
+	}
+
 	if (fcntl(STDIN_FILENO, F_GETFD) < 0) die("check stdin", errno);
 	if (fcntl(STDOUT_FILENO, F_GETFD) < 0) die("check stdout", errno);
 
 	state.command = argv + optind;
 	if (!state.limit) state.limit = default_jobs();
-
-	char *line = NULL;
-	size_t line_capacity = 0;
-	int read_error = 0;
-	struct job *job = read_batch(lines, &line, &line_capacity, &read_error);
-	if (!job && !read_error) {
-		free(line);
-		return 0;
-	}
 
 	// An early stdin close is normal for commands such as head.
 	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) die("ignore SIGPIPE", errno);
@@ -332,6 +547,22 @@ int main(int argc, char **argv) {
 	check(posix_spawnattr_init(&attributes), "initialize spawn attributes");
 	check(posix_spawnattr_setsigdefault(&attributes, &defaults), "set child signals");
 	check(posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETSIGDEF), "set spawn flags");
+
+	if (persistent) {
+		int status = stream_workers(state.command, state.limit, lines, &attributes);
+		posix_spawnattr_destroy(&attributes);
+		return status;
+	}
+
+	char *line = NULL;
+	size_t line_capacity = 0;
+	int read_error = 0;
+	struct job *job = read_batch(lines, &line, &line_capacity, &read_error);
+	if (!job && !read_error) {
+		free(line);
+		posix_spawnattr_destroy(&attributes);
+		return 0;
+	}
 
 	struct worker_args args = {&state, &attributes};
 	pthread_t *workers = calloc(state.limit, sizeof *workers);
