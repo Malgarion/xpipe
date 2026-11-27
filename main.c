@@ -104,16 +104,68 @@ static void close_poll_fd(struct pollfd *fd){
 	fd->fd = -1;
 }
 //==============================================================================================================
-static void transfer_job_io(struct job *job, int input, int output){
+static void publish_job_stdout(struct state *state, struct job *job, int fd) {
+	// The caller holds the state lock and stops reading fd after publication.
+	job->output_fd = fd;
+	job->output_ready = true;
+	pthread_cond_signal(&state->output_ready);
+}
+//==============================================================================================================
+static ssize_t send_batch_span(int fd, char *data, size_t length,
+			       bool *use_vmsplice, unsigned int flags) {
+	if (*use_vmsplice) {
+		struct iovec span = {.iov_base = data, .iov_len = length};
+		ssize_t size = vmsplice(fd, &span, 1, flags);
+		if (size > 0) return size;
+		if (size < 0 && errno != ENOSYS && errno != EINVAL &&
+		    errno != EPERM && errno != EOPNOTSUPP) return -1;
+		*use_vmsplice = false;
+	}
+	return write(fd, data, length);
+}
+//==============================================================================================================
+static int send_batch_tail(int fd, struct job *job, size_t sent, bool use_vmsplice) {
+	while (use_vmsplice && sent < job->length) {
+		ssize_t size = send_batch_span(fd, job->input + sent, job->length - sent,
+			&use_vmsplice, 0);
+		if (size < 0) {
+			if (errno == EINTR) continue;
+			return errno;
+		}
+		if (!size) return EIO;
+		sent += (size_t)size;
+	}
+	return write_all(fd, job->input + sent, job->length - sent);
+}
+//==============================================================================================================
+static void transfer_job_io(struct job *job, int input, int output, struct state *ordered){
 	struct pollfd fds[] = {
 		{.fd = input, .events = POLLOUT},
 		{.fd = output, .events = POLLIN}
 	};
 	size_t sent = 0;
+	bool use_vmsplice = job->mapped_input != 0;
 	size_t capacity = 0;
 	char buffer[65536];
 
 	while (fds[0].fd >= 0 || fds[1].fd >= 0) {
+		if (ordered && fds[1].fd >= 0) {
+			pthread_mutex_lock(&ordered->lock);
+			bool is_first = ordered->output_head == job;
+			if (is_first) publish_job_stdout(ordered, job, fds[1].fd);
+			pthread_mutex_unlock(&ordered->lock);
+
+			if (is_first) {
+				if (fds[0].fd >= 0) {
+					if (fcntl(input, F_SETFL, 0) < 0) die("set command stdin blocking", errno);
+					int error = send_batch_tail(input, job, sent, use_vmsplice);
+					close(input);
+					if (error != EPIPE) check(error, "write command stdin");
+				}
+				return;
+			}
+
+		}
 		if (poll(fds, 2, -1) < 0) {
 			if (errno == EINTR) continue;
 			die("poll command pipes", errno);
@@ -129,8 +181,9 @@ static void transfer_job_io(struct job *job, int input, int output){
 
 		if (fds[0].revents) {
 			size_t remaining = job->length - sent;
-			size_t chunk = remaining < sizeof buffer ? remaining : sizeof buffer;
-			ssize_t size = write(fds[0].fd, job->input + sent, chunk);
+			size_t chunk = use_vmsplice || remaining < sizeof buffer ? remaining : sizeof buffer;
+			ssize_t size = send_batch_span(fds[0].fd, job->input + sent, chunk,
+				&use_vmsplice, SPLICE_F_NONBLOCK);
 			if (size > 0) {
 				sent += (size_t)size;
 				if (sent == job->length) close_poll_fd(&fds[0]);
@@ -206,25 +259,6 @@ static int send_partition(int fd, const struct job *job, int input) {
 	return 0;
 }
 //==============================================================================================================
-static int send_batch(int fd, const struct job *job) {
-	if (!job->mapped_input) return write_all(fd, job->input, job->length);
-
-	struct iovec span = {.iov_base = job->input, .iov_len = job->length};
-	while (span.iov_len) {
-		ssize_t size = vmsplice(fd, &span, 1, 0);
-		if (size > 0) {
-			span.iov_base = (char *)span.iov_base + size;
-			span.iov_len -= (size_t)size;
-			continue;
-		}
-		if (size < 0 && errno == EINTR) continue;
-		if (size < 0 && errno != ENOSYS && errno != EINVAL &&
-		    errno != EPERM && errno != EOPNOTSUPP) return errno;
-		return write_all(fd, span.iov_base, span.iov_len);
-	}
-	return 0;
-}
-//==============================================================================================================
 static bool run_job(struct job *job, struct state *state, const posix_spawnattr_t *attributes) {
 	char **command = state->command;
 	pid_t child;
@@ -235,23 +269,19 @@ static bool run_job(struct job *job, struct state *state, const posix_spawnattr_
 		return false;
 	}
 
-	if (state->ordered) {
+	if (state->partition_fd >= 0) {
 		if (fcntl(input, F_SETFL, 0) < 0) die("set command stdin blocking", errno);
 
 		// The writer owns the read end and drains jobs in input order.
 		pthread_mutex_lock(&state->lock);
-		job->output_fd = output;
-		job->output_ready = true;
-		pthread_cond_signal(&state->output_ready);
+		publish_job_stdout(state, job, output);
 		pthread_mutex_unlock(&state->lock);
 
-		error = state->partition_fd >= 0
-			? send_partition(state->partition_fd, job, input)
-			: send_batch(input, job);
+		error = send_partition(state->partition_fd, job, input);
 		close(input);
 		if (error != EPIPE) check(error, "write command stdin");
 	} else {
-		transfer_job_io(job, input, output);
+		transfer_job_io(job, input, output, state->ordered ? state : NULL);
 	}
 
 	return wait_command(child, command[0], true);
@@ -481,7 +511,7 @@ static void *worker(void *argument) {
 		pthread_mutex_unlock(&state->lock);
 
 		bool success = run_job(job, state, args->attributes);
-		// A downstream pipe can keep references to vmsplice pages after the child exits.
+		// Downstream pipes can retain these pages after the child exits.
 		if (job->mapped_input) munmap(job->input, job->mapped_input);
 		else free(job->input);
 
@@ -543,6 +573,7 @@ static void *writer(void *argument) {
 		if (state->ordered && job->output_ready) {
 			int fd = job->output_fd;
 			pthread_mutex_unlock(&state->lock);
+			emit_output(job, NULL);
 			stream_output(fd, &splicing);
 			pthread_mutex_lock(&state->lock);
 			while (!job->done) pthread_cond_wait(&state->output_ready, &state->lock);
@@ -551,6 +582,7 @@ static void *writer(void *argument) {
 		if (!state->output_head) state->output_tail = NULL;
 		pthread_mutex_unlock(&state->lock);
 		if (!state->ordered) emit_output(job, &needs_separator);
+		else if (!job->output_ready) emit_output(job, NULL);
 		free(job->output);
 		free(job);
 		pthread_mutex_lock(&state->lock);
@@ -794,6 +826,8 @@ int main(int argc, char **argv) {
 
 	while (job) {
 		pthread_mutex_lock(&state.lock);
+		while (state.pending == state.limit)
+			pthread_cond_wait(&state.slot_ready, &state.lock);
 		if (worker_count < state.limit && worker_count <= state.pending) {
 			check(pthread_create(&workers[worker_count], NULL, worker, &args), "start worker");
 			++worker_count;
@@ -804,9 +838,9 @@ int main(int argc, char **argv) {
 		if (state.ordered) enqueue_output(&state, job);
 		++state.pending;
 		pthread_cond_signal(&state.work_ready);
-		while (state.pending == state.limit) pthread_cond_wait(&state.slot_ready, &state.lock);
 		pthread_mutex_unlock(&state.lock);
 
+		// Prepare one batch ahead while the active children consume their own inputs.
 		if (persistent) job = next_partition(&parts);
 		else job = reader.eof ? NULL : read_batch(lines, &reader, state.ordered);
 	}
