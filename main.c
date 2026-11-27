@@ -11,6 +11,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <sched.h>
@@ -19,10 +22,12 @@ extern char **environ;
 //==============================================================================================================
 struct job {
 	char *input;
-	size_t length;
+	size_t length, mapped_input;
+	off_t start, end;
 	char *output;
 	size_t output_length;
-	bool done;
+	int output_fd;
+	bool output_ready, done;
 	struct job *next_input;
 	struct job *next_output;
 };
@@ -35,6 +40,7 @@ struct state {
 	size_t pending, limit;
 	bool ordered, eof, failed;
 	char **command;
+	int partition_fd;
 };
 //==============================================================================================================
 static void die(const char *operation, int error) {
@@ -137,10 +143,15 @@ static void transfer_job_io(struct job *job, int input, int output){
 }
 //==============================================================================================================
 static int spawn_command(char **command, const posix_spawnattr_t *attributes,
-			 pid_t *child, int *child_input, int *child_output) {
+			 pid_t *child, int *child_input, int *child_output, bool ordered) {
 	int input[2], output[2];
 	if (pipe2(input, O_CLOEXEC) < 0) die("create stdin pipe", errno);
 	if (pipe2(output, O_CLOEXEC) < 0) die("create stdout pipe", errno);
+	if (ordered) {
+		// The kernel may limit pipe growth per user.
+		if (fcntl(input[1], F_GETPIPE_SZ) < 1048576) (void)fcntl(input[1], F_SETPIPE_SZ, 1048576);
+		if (fcntl(output[0], F_GETPIPE_SZ) < 1048576) (void)fcntl(output[0], F_SETPIPE_SZ, 1048576);
+	}
 	if (fcntl(input[1], F_SETFL, O_NONBLOCK) < 0) die("set stdin pipe nonblocking", errno);
 	
 	posix_spawn_file_actions_t actions;
@@ -173,15 +184,76 @@ static bool wait_command(pid_t child, const char *command, bool report) {
 	return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 //==============================================================================================================
-static bool run_job(struct job *job, char **command, const posix_spawnattr_t *attributes) {
+static ssize_t read_partition(int fd, off_t start, off_t end, char *buffer, size_t capacity) {
+	off_t remaining = end - start;
+	size_t length = (uintmax_t)remaining < capacity ? (size_t)remaining : capacity;
+	ssize_t size;
+	do {
+		size = pread(fd, buffer, length, start);
+	} while (size < 0 && errno == EINTR);
+	return size;
+}
+//==============================================================================================================
+static int send_partition(int fd, const struct job *job, int input) {
+	char buffer[65536];
+	for (off_t offset = job->start; offset < job->end;) {
+		ssize_t size = read_partition(fd, offset, job->end, buffer, sizeof buffer);
+		if (size <= 0) die("read input partition", size < 0 ? errno : EIO);
+		int error = write_all(input, buffer, (size_t)size);
+		if (error) return error;
+		offset += size;
+	}
+	return 0;
+}
+//==============================================================================================================
+static int send_batch(int fd, const struct job *job) {
+	if (!job->mapped_input) return write_all(fd, job->input, job->length);
+
+	struct iovec span = {.iov_base = job->input, .iov_len = job->length};
+	while (span.iov_len) {
+		ssize_t size = vmsplice(fd, &span, 1, 0);
+		if (size > 0) {
+			span.iov_base = (char *)span.iov_base + size;
+			span.iov_len -= (size_t)size;
+			continue;
+		}
+		if (size < 0 && errno == EINTR) continue;
+		if (size < 0 && errno != ENOSYS && errno != EINVAL &&
+		    errno != EPERM && errno != EOPNOTSUPP) return errno;
+		return write_all(fd, span.iov_base, span.iov_len);
+	}
+	return 0;
+}
+//==============================================================================================================
+static bool run_job(struct job *job, struct state *state, const posix_spawnattr_t *attributes) {
+	char **command = state->command;
 	pid_t child;
 	int input, output;
-	int error = spawn_command(command, attributes, &child, &input, &output);
+	int error = spawn_command(command, attributes, &child, &input, &output, state->ordered);
 	if (error) {
 		fprintf(stderr, "xpipe: %s: %s\n", command[0], strerror(error));
 		return false;
 	}
-	transfer_job_io(job, input, output);
+
+	if (state->ordered) {
+		if (fcntl(input, F_SETFL, 0) < 0) die("set command stdin blocking", errno);
+
+		// The writer owns the read end and drains jobs in input order.
+		pthread_mutex_lock(&state->lock);
+		job->output_fd = output;
+		job->output_ready = true;
+		pthread_cond_signal(&state->output_ready);
+		pthread_mutex_unlock(&state->lock);
+
+		error = state->partition_fd >= 0
+			? send_partition(state->partition_fd, job, input)
+			: send_batch(input, job);
+		close(input);
+		if (error != EPIPE) check(error, "write command stdin");
+	} else {
+		transfer_job_io(job, input, output);
+	}
+
 	return wait_command(child, command[0], true);
 }
 //==============================================================================================================
@@ -235,7 +307,7 @@ static int stream_workers(char **command, size_t count, size_t lines,
 	size_t started = 0;
 	for (; started < count; ++started) {
 		struct pollfd *in = &fds[1 + 2 * started], *out = in + 1;
-		error = spawn_command(command, attributes, &workers[started].pid, &in->fd, &out->fd);
+		error = spawn_command(command, attributes, &workers[started].pid, &in->fd, &out->fd, false);
 		if (error) {
 			fprintf(stderr, "xpipe: failed to run command '%s': %s\n", command[0], strerror(error));
 			result = error == ENOENT ? 127 : 126;
@@ -408,8 +480,10 @@ static void *worker(void *argument) {
 		if (!state->input_head) state->input_tail = NULL; 
 		pthread_mutex_unlock(&state->lock);
 
-		bool success = run_job(job, state->command, args->attributes);
-		free(job->input);
+		bool success = run_job(job, state, args->attributes);
+		// A downstream pipe can keep references to vmsplice pages after the child exits.
+		if (job->mapped_input) munmap(job->input, job->mapped_input);
+		else free(job->input);
 
 		pthread_mutex_lock(&state->lock);
 		state->failed |= !success;
@@ -429,20 +503,54 @@ static void emit_output(const struct job * job, bool *needs_separator) {
 	if (needs_separator) *needs_separator = job->output[job->output_length - 1] != '\n';
 }
 //==============================================================================================================
+static void stream_output(int fd, bool *splicing) {
+	while (*splicing) {
+		ssize_t size = splice(fd, NULL, STDOUT_FILENO, NULL, 1024 * 1024, 0);
+		if (size > 0) continue;
+		if (size == 0) {
+			close(fd);
+			return;
+		}
+		if (errno == EINTR) continue;
+		if (errno != EINVAL && errno != ENOSYS && errno != EOPNOTSUPP && errno != EXDEV)
+			die("splice command stdout", errno);
+		*splicing = false;
+	}
+
+	char buffer[65536];
+	for (;;) {
+		ssize_t size = read(fd, buffer, sizeof buffer);
+		if (size == 0) break;
+		if (size < 0) {
+			if (errno == EINTR) continue;
+			die("read command stdout", errno);
+		}
+		check(write_all(STDOUT_FILENO, buffer, (size_t)size), "write stdout");
+	}
+	close(fd);
+}
+//==============================================================================================================
 static void *writer(void *argument) {
 	struct state *state = argument;
-	bool needs_separator = false;
+	bool needs_separator = false, splicing = true;
 	pthread_mutex_lock(&state->lock);
 	while (!state->eof || state->pending) {
 		struct job *job = state->output_head;
-		if (!job || !job->done) {
+		if (!job || (!job->done && !job->output_ready)) {
 			pthread_cond_wait(&state->output_ready, &state->lock);
 			continue;
+		}
+		if (state->ordered && job->output_ready) {
+			int fd = job->output_fd;
+			pthread_mutex_unlock(&state->lock);
+			stream_output(fd, &splicing);
+			pthread_mutex_lock(&state->lock);
+			while (!job->done) pthread_cond_wait(&state->output_ready, &state->lock);
 		}
 		state->output_head = job->next_output;
 		if (!state->output_head) state->output_tail = NULL;
 		pthread_mutex_unlock(&state->lock);
-		emit_output(job, state->ordered ? NULL : &needs_separator);
+		if (!state->ordered) emit_output(job, &needs_separator);
 		free(job->output);
 		free(job);
 		pthread_mutex_lock(&state->lock);
@@ -453,40 +561,152 @@ static void *writer(void *argument) {
 	return NULL;
 }
 //==============================================================================================================
-static struct job *read_batch(size_t lines, char **line, size_t *line_capacity, int *read_error) {
+struct batch_reader {
+	char buffer[256 * 1024];
+	size_t offset, length;
+	int error;
+	bool eof;
+};
+//==============================================================================================================
+static void append_batch_input(struct job *job, size_t *capacity, const char *data,
+			       size_t size, bool ordered) {
+	if (size > SIZE_MAX - job->length) die("input batch too large", EOVERFLOW);
+	size_t required = job->length + size;
+	if (!ordered || required < 256 * 1024) {
+		append_bytes(&job->input, &job->length, capacity, data, size);
+		return;
+	}
+
+	if (required > job->mapped_input) {
+		size_t grown = job->mapped_input <= SIZE_MAX / 2 ? job->mapped_input * 2 : SIZE_MAX;
+		if (grown < required) grown = required;
+		char *buffer;
+		if (job->mapped_input) {
+			buffer = mremap(job->input, job->mapped_input, grown, MREMAP_MAYMOVE);
+		} else {
+			buffer = mmap(NULL, grown, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+			if (buffer != MAP_FAILED) {
+				if (job->length) memcpy(buffer, job->input, job->length);
+				free(job->input);
+			}
+		}
+		if (buffer == MAP_FAILED) die("allocate mapped input batch", errno);
+		job->input = buffer;
+		job->mapped_input = grown;
+	}
+
+	memcpy(job->input + job->length, data, size);
+	job->length = required;
+}
+//==============================================================================================================
+static struct job *read_batch(size_t lines, struct batch_reader *reader, bool ordered) {
 	struct job *job = calloc(1, sizeof *job);
 	if (!job) die("allocate job", errno);
 
 	size_t capacity = 0;
-	for (size_t i = 0; i < lines; ++i) {
-		ssize_t size = getline(line, line_capacity, stdin);
-		if (size < 0) {
-			if (!feof(stdin)) *read_error = errno ? errno : EIO;
-			break;
+	while (lines) {
+		if (reader->offset == reader->length) {
+			ssize_t size;
+			do {
+				size = read(STDIN_FILENO, reader->buffer, sizeof reader->buffer);
+			} while (size < 0 && errno == EINTR);
+			if (size <= 0) {
+				reader->eof = true;
+				if (size < 0) reader->error = errno;
+				break;
+			}
+			reader->offset = 0;
+			reader->length = (size_t)size;
 		}
-		if ((size_t)size > SIZE_MAX - job->length) die("input batch too large", EOVERFLOW);
-		size_t required = job->length + (size_t)size;
-		if (required > capacity) {
-			capacity = capacity <= SIZE_MAX / 2 ? capacity * 2 : SIZE_MAX;
-			if (capacity < required) capacity = required;
-			char *buffer = realloc(job->input, capacity);
-			if (!buffer) die("allocate input batch", errno);
-			job->input = buffer;
+
+		const char *start = reader->buffer + reader->offset;
+		const char *end = reader->buffer + reader->length;
+		const char *cursor = start;
+		while (lines && cursor < end) {
+			const char *newline = memchr(cursor, '\n', (size_t)(end - cursor));
+			if (!newline) {
+				cursor = end;
+				break;
+			}
+			cursor = newline + 1;
+			--lines;
 		}
-		memcpy(job->input + job->length, *line, (size_t)size);
-		job->length = required;
+		size_t length = (size_t)(cursor - start);
+		append_batch_input(job, &capacity, start, length, ordered);
+		reader->offset += length;
 	}
+
 	if (job->length) return job;
 	free(job);
 	return NULL;
 }
 //==============================================================================================================
+struct partitions {
+	off_t start, end, target, step;
+	size_t extra;
+};
+//==============================================================================================================
+static struct partitions prepare_partitions(size_t count) {
+	struct stat info;
+	if (fstat(STDIN_FILENO, &info) < 0) die("stat stdin", errno);
+	if (!S_ISREG(info.st_mode)) {
+		fputs("xpipe: -w -o requires a regular file on stdin. Use -o for piped input.\n", stderr);
+		exit(EXIT_FAILURE);
+	}
+
+	off_t start = lseek(STDIN_FILENO, 0, SEEK_CUR);
+	if (start < 0) die("seek stdin", errno);
+	off_t end = info.st_size;
+
+	if (start > end) start = end;
+	uintmax_t length = (uintmax_t)(end - start);
+	return (struct partitions){
+		.start = start, .end = end, .target = start,
+		.step = (off_t)(length / count), .extra = (size_t)(length % count)
+	};
+}
+//==============================================================================================================
+static struct job *next_partition(struct partitions *parts) {
+	if (parts->start == parts->end) return NULL;
+
+	// Advance past nominal cuts already covered by an earlier long line.
+	while (parts->target <= parts->start) {
+		parts->target += parts->step;
+		if (parts->extra) {
+			++parts->target;
+			--parts->extra;
+		}
+	}
+
+	char buffer[65536];
+	off_t boundary = parts->target;
+	if (boundary < parts->end) {
+		--boundary; // Keep the cut as-is if it already follows a newline.
+		while (boundary < parts->end) {
+			ssize_t size = read_partition(STDIN_FILENO, boundary, parts->end, buffer, sizeof buffer);
+			if (size <= 0) die("find partition boundary", size < 0 ? errno : EIO);
+			const char *newline = memchr(buffer, '\n', (size_t)size);
+			boundary += newline ? newline - buffer + 1 : size;
+			if (newline) break;
+		}
+	}
+
+	struct job *job = calloc(1, sizeof *job);
+	if (!job) die("allocate partition job", errno);
+	job->start = parts->start;
+	job->end = boundary;
+	parts->start = boundary;
+	return job;
+}
+//==============================================================================================================
 static void usage(FILE *stream) {
-	fputs("Usage: xpipe [-j N] [-L N] [-o | -w] command [args ...]\n"
+	fputs("Usage: xpipe [-j N] [-L N] [-o] [-w] command [args ...]\n"
 		"  -j N  Concurrent jobs (default: core_count)\n"
 		"  -L N  Input lines per job (default: 1)\n"
 		"  -o    Emit job output in input order\n"
-		"  -w    Reuse command processes and merge complete stdout lines\n", stream);
+		"  -w    Reuse command processes and merge complete stdout lines\n"
+		"  -w -o Split input into contiguous partitions and stream their outputs in order\n"
+		"        Requires a regular file on stdin and ignores -L\n", stream);
 }
 //==============================================================================================================
 int main(int argc, char **argv) {
@@ -494,7 +714,8 @@ int main(int argc, char **argv) {
 		.lock = PTHREAD_MUTEX_INITIALIZER,
 		.work_ready = PTHREAD_COND_INITIALIZER,
 		.output_ready = PTHREAD_COND_INITIALIZER,
-		.slot_ready = PTHREAD_COND_INITIALIZER
+		.slot_ready = PTHREAD_COND_INITIALIZER,
+		.partition_fd = -1
 	};
 	size_t lines = 1;
 	bool persistent = false;
@@ -527,11 +748,6 @@ int main(int argc, char **argv) {
 		return 2;
 	}
 
-	if (persistent && state.ordered) {
-		fputs("xpipe: -w cannot be combined with -o\n", stderr);
-		return 2;
-	}
-
 	if (fcntl(STDIN_FILENO, F_GETFD) < 0) die("check stdin", errno);
 	if (fcntl(STDOUT_FILENO, F_GETFD) < 0) die("check stdout", errno);
 
@@ -548,18 +764,23 @@ int main(int argc, char **argv) {
 	check(posix_spawnattr_setsigdefault(&attributes, &defaults), "set child signals");
 	check(posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETSIGDEF), "set spawn flags");
 
-	if (persistent) {
+	if (persistent && !state.ordered) {
 		int status = stream_workers(state.command, state.limit, lines, &attributes);
 		posix_spawnattr_destroy(&attributes);
 		return status;
 	}
 
-	char *line = NULL;
-	size_t line_capacity = 0;
-	int read_error = 0;
-	struct job *job = read_batch(lines, &line, &line_capacity, &read_error);
-	if (!job && !read_error) {
-		free(line);
+	struct batch_reader reader = {0};
+	struct partitions parts = {0};
+	struct job *job;
+	if (persistent) {
+		parts = prepare_partitions(state.limit);
+		state.partition_fd = STDIN_FILENO;
+		job = next_partition(&parts);
+	} else {
+		job = read_batch(lines, &reader, state.ordered);
+	}
+	if (!job && !reader.error) {
 		posix_spawnattr_destroy(&attributes);
 		return 0;
 	}
@@ -586,7 +807,8 @@ int main(int argc, char **argv) {
 		while (state.pending == state.limit) pthread_cond_wait(&state.slot_ready, &state.lock);
 		pthread_mutex_unlock(&state.lock);
 
-		job = read_error || feof(stdin) ? NULL : read_batch(lines, &line, &line_capacity, &read_error);
+		if (persistent) job = next_partition(&parts);
+		else job = reader.eof ? NULL : read_batch(lines, &reader, state.ordered);
 	}
 
 	pthread_mutex_lock(&state.lock);
@@ -599,8 +821,7 @@ int main(int argc, char **argv) {
 	pthread_join(output_thread, NULL);
 	posix_spawnattr_destroy(&attributes);
 	free(workers);
-	free(line);
-	if (read_error) die("read stdin", read_error);
+	if (reader.error) die("read stdin", reader.error);
 	return state.failed ? EXIT_FAILURE : EXIT_SUCCESS;
 }
 //==============================================================================================================
