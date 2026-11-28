@@ -273,7 +273,7 @@ struct input_feeder {
 	struct job *job;
 	int fd;
 };
-
+//==============================================================================================================
 static void *feed_blocks(void *argument) {
 	struct input_feeder *feed = argument;
 	struct job *job = feed->job;
@@ -303,7 +303,7 @@ static void *feed_blocks(void *argument) {
 	if (fd >= 0) close(fd);
 	return NULL;
 }
-
+//==============================================================================================================
 static void drain_ordered_job(struct state *state, struct job *job, int output) {
 	char buffer[65536];
 	size_t capacity = 0;
@@ -323,6 +323,7 @@ static void drain_ordered_job(struct state *state, struct job *job, int output) 
 	}
 	close(output);
 }
+//==============================================================================================================
 static bool run_job(struct job *job, struct state *state, const posix_spawnattr_t *attributes) {
 	char **command = state->command;
 	pid_t child;
@@ -696,7 +697,7 @@ static bool refill_batch_reader(struct batch_reader *reader) {
 	reader->length = (size_t)size;
 	return true;
 }
-
+//==============================================================================================================
 static void queue_batch_blocks(struct job *job,
 			       struct batch_reader *reader, size_t lines) {
 	while (lines && refill_batch_reader(reader)) {
@@ -733,7 +734,7 @@ static void queue_batch_blocks(struct job *job,
 	pthread_cond_signal(&job->input_ready);
 	pthread_mutex_unlock(&job->input_lock);
 }
-
+//==============================================================================================================
 static struct job *next_incremental_batch(struct batch_reader *reader) {
 	if (!refill_batch_reader(reader)) return NULL;
 	struct job *job = calloc(1, sizeof *job);
@@ -743,6 +744,7 @@ static struct job *next_incremental_batch(struct batch_reader *reader) {
 	check(pthread_cond_init(&job->input_ready, NULL), "initialize feeder condition");
 	return job;
 }
+//==============================================================================================================
 static void append_batch_input(struct job *job, size_t *capacity, const char *data,
 			       size_t size, bool ordered) {
 	if (size > SIZE_MAX - job->length) die("input batch too large", EOVERFLOW);
@@ -879,7 +881,7 @@ static void usage(FILE *stream) {
 		"  -j N  Concurrent jobs (default: core_count)\n"
 		"  -L N  Input lines per job (default: 1)\n"
 		"  -o    Emit job output in input order, feeding batches as they arrive\n"
-		"        Set XPIPE_EARLY_INPUT=0 to buffer complete batches before dispatch\n"
+		"        Set XPIPES_EARLY_INPUT=0 to buffer complete batches before dispatch\n"
 		"  -w    Reuse command processes and merge complete stdout lines\n"
 		"  -w -o Split input into contiguous partitions and stream their outputs in order\n"
 		"        Requires a regular file on stdin and ignores -L\n", stream);
@@ -947,7 +949,7 @@ int main(int argc, char **argv) {
 	}
 
 	struct batch_reader reader = {0};
-	const char *early_input = getenv("XPIPE_EARLY_INPUT");
+	const char *early_input = getenv("XPIPES_EARLY_INPUT");
 	bool incremental = state.ordered && !persistent &&
 		(!early_input || strcmp(early_input, "0") != 0);
 	struct partitions parts = {0};
