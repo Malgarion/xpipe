@@ -20,7 +20,17 @@
 //==============================================================================================================
 extern char **environ;
 //==============================================================================================================
+struct input_block {
+	struct input_block *next;
+	size_t length;
+	char data[];
+};
+
 struct job {
+	struct input_block *block_head, *block_tail;
+	bool incremental, input_done;
+	pthread_mutex_t input_lock;
+	pthread_cond_t input_ready;
 	char *input;
 	size_t length, mapped_input;
 	off_t start, end;
@@ -259,6 +269,60 @@ static int send_partition(int fd, const struct job *job, int input) {
 	return 0;
 }
 //==============================================================================================================
+struct input_feeder {
+	struct job *job;
+	int fd;
+};
+
+static void *feed_blocks(void *argument) {
+	struct input_feeder *feed = argument;
+	struct job *job = feed->job;
+	int fd = feed->fd;
+
+	pthread_mutex_lock(&job->input_lock);
+	for (;;) {
+		while (!job->block_head && !job->input_done)
+			pthread_cond_wait(&job->input_ready, &job->input_lock);
+		struct input_block *block = job->block_head;
+		if (!block) break;
+		job->block_head = block->next;
+		if (!job->block_head) job->block_tail = NULL;
+		pthread_mutex_unlock(&job->input_lock);
+
+		if (fd >= 0) {
+			int error = write_all(fd, block->data, block->length);
+			if (error == EPIPE) {
+				close(fd);
+				fd = -1;
+			} else check(error, "write command stdin");
+		}
+		free(block);
+		pthread_mutex_lock(&job->input_lock);
+	}
+	pthread_mutex_unlock(&job->input_lock);
+	if (fd >= 0) close(fd);
+	return NULL;
+}
+
+static void drain_ordered_job(struct state *state, struct job *job, int output) {
+	char buffer[65536];
+	size_t capacity = 0;
+
+	for (;;) {
+		pthread_mutex_lock(&state->lock);
+		bool first = state->output_head == job;
+		if (first) publish_job_stdout(state, job, output);
+		pthread_mutex_unlock(&state->lock);
+		if (first) return;
+
+		ssize_t size = read(output, buffer, sizeof buffer);
+		if (size < 0 && errno == EINTR) continue;
+		if (size < 0) die("read command stdout", errno);
+		if (!size) break;
+		append_bytes(&job->output, &job->output_length, &capacity, buffer, (size_t)size);
+	}
+	close(output);
+}
 static bool run_job(struct job *job, struct state *state, const posix_spawnattr_t *attributes) {
 	char **command = state->command;
 	pid_t child;
@@ -266,10 +330,21 @@ static bool run_job(struct job *job, struct state *state, const posix_spawnattr_
 	int error = spawn_command(command, attributes, &child, &input, &output, state->ordered);
 	if (error) {
 		fprintf(stderr, "xpipe: %s: %s\n", command[0], strerror(error));
+		if (job->incremental) {
+			struct input_feeder feeder = {job, -1};
+			feed_blocks(&feeder);
+		}
 		return false;
 	}
 
-	if (state->partition_fd >= 0) {
+	if (job->incremental) {
+		if (fcntl(input, F_SETFL, 0) < 0) die("set command stdin blocking", errno);
+		struct input_feeder feeder = {job, input};
+		pthread_t thread;
+		check(pthread_create(&thread, NULL, feed_blocks, &feeder), "start input feeder");
+		drain_ordered_job(state, job, output);
+		check(pthread_join(thread, NULL), "join input feeder");
+	} else if (state->partition_fd >= 0) {
 		if (fcntl(input, F_SETFL, 0) < 0) die("set command stdin blocking", errno);
 
 		// The writer owns the read end and drains jobs in input order.
@@ -511,6 +586,10 @@ static void *worker(void *argument) {
 		pthread_mutex_unlock(&state->lock);
 
 		bool success = run_job(job, state, args->attributes);
+		if (job->incremental) {
+			pthread_cond_destroy(&job->input_ready);
+			pthread_mutex_destroy(&job->input_lock);
+		}
 		// Downstream pipes can retain these pages after the child exits.
 		if (job->mapped_input) munmap(job->input, job->mapped_input);
 		else free(job->input);
@@ -600,6 +679,70 @@ struct batch_reader {
 	bool eof;
 };
 //==============================================================================================================
+static bool refill_batch_reader(struct batch_reader *reader) {
+	if (reader->offset < reader->length) return true;
+	if (reader->eof) return false;
+
+	ssize_t size;
+	do {
+		size = read(STDIN_FILENO, reader->buffer, sizeof reader->buffer);
+	} while (size < 0 && errno == EINTR);
+	if (size <= 0) {
+		reader->eof = true;
+		if (size < 0) reader->error = errno;
+		return false;
+	}
+	reader->offset = 0;
+	reader->length = (size_t)size;
+	return true;
+}
+
+static void queue_batch_blocks(struct job *job,
+			       struct batch_reader *reader, size_t lines) {
+	while (lines && refill_batch_reader(reader)) {
+		const char *start = reader->buffer + reader->offset;
+		const char *end = reader->buffer + reader->length;
+		const char *cursor = start;
+		while (lines && cursor < end) {
+			const char *newline = memchr(cursor, '\n', (size_t)(end - cursor));
+			if (!newline) {
+				cursor = end;
+				break;
+			}
+			cursor = newline + 1;
+			--lines;
+		}
+		size_t length = (size_t)(cursor - start);
+		struct input_block *block = malloc(sizeof *block + length);
+		if (!block) die("allocate input block", errno);
+		block->next = NULL;
+		block->length = length;
+		memcpy(block->data, start, length);
+		reader->offset += length;
+
+		pthread_mutex_lock(&job->input_lock);
+		bool was_empty = !job->block_head;
+		if (job->block_tail) job->block_tail->next = block;
+		else job->block_head = block;
+		job->block_tail = block;
+		if (was_empty) pthread_cond_signal(&job->input_ready);
+		pthread_mutex_unlock(&job->input_lock);
+	}
+	pthread_mutex_lock(&job->input_lock);
+	job->input_done = true;
+	pthread_cond_signal(&job->input_ready);
+	pthread_mutex_unlock(&job->input_lock);
+}
+
+static struct job *next_incremental_batch(struct batch_reader *reader) {
+	if (!refill_batch_reader(reader)) return NULL;
+	struct job *job = calloc(1, sizeof *job);
+	if (!job) die("allocate job", errno);
+	job->incremental = true;
+	check(pthread_mutex_init(&job->input_lock, NULL), "initialize feeder lock");
+	check(pthread_cond_init(&job->input_ready, NULL), "initialize feeder condition");
+	return job;
+}
 static void append_batch_input(struct job *job, size_t *capacity, const char *data,
 			       size_t size, bool ordered) {
 	if (size > SIZE_MAX - job->length) die("input batch too large", EOVERFLOW);
@@ -735,7 +878,8 @@ static void usage(FILE *stream) {
 	fputs("Usage: xpipe [-j N] [-L N] [-o] [-w] command [args ...]\n"
 		"  -j N  Concurrent jobs (default: core_count)\n"
 		"  -L N  Input lines per job (default: 1)\n"
-		"  -o    Emit job output in input order\n"
+		"  -o    Emit job output in input order, feeding batches as they arrive\n"
+		"        Set XPIPE_EARLY_INPUT=0 to buffer complete batches before dispatch\n"
 		"  -w    Reuse command processes and merge complete stdout lines\n"
 		"  -w -o Split input into contiguous partitions and stream their outputs in order\n"
 		"        Requires a regular file on stdin and ignores -L\n", stream);
@@ -803,6 +947,9 @@ int main(int argc, char **argv) {
 	}
 
 	struct batch_reader reader = {0};
+	const char *early_input = getenv("XPIPE_EARLY_INPUT");
+	bool incremental = state.ordered && !persistent &&
+		(!early_input || strcmp(early_input, "0") != 0);
 	struct partitions parts = {0};
 	struct job *job;
 	if (persistent) {
@@ -810,7 +957,7 @@ int main(int argc, char **argv) {
 		state.partition_fd = STDIN_FILENO;
 		job = next_partition(&parts);
 	} else {
-		job = read_batch(lines, &reader, state.ordered);
+		job = incremental ? next_incremental_batch(&reader) : read_batch(lines, &reader, state.ordered);
 	}
 	if (!job && !reader.error) {
 		posix_spawnattr_destroy(&attributes);
@@ -841,7 +988,10 @@ int main(int argc, char **argv) {
 		pthread_mutex_unlock(&state.lock);
 
 		// Prepare one batch ahead while the active children consume their own inputs.
-		if (persistent) job = next_partition(&parts);
+		if (incremental) {
+			queue_batch_blocks(job, &reader, lines);
+			job = next_incremental_batch(&reader);
+		} else if (persistent) job = next_partition(&parts);
 		else job = reader.eof ? NULL : read_batch(lines, &reader, state.ordered);
 	}
 
