@@ -11,9 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
-#include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <sched.h>
@@ -32,7 +30,7 @@ struct job {
 	pthread_mutex_t input_lock;
 	pthread_cond_t input_ready;
 	char *input;
-	size_t length, mapped_input;
+	size_t length;
 	off_t start, end;
 	char *output;
 	size_t output_length;
@@ -121,61 +119,16 @@ static void publish_job_stdout(struct state *state, struct job *job, int fd) {
 	pthread_cond_signal(&state->output_ready);
 }
 //==============================================================================================================
-static ssize_t send_batch_span(int fd, char *data, size_t length,
-			       bool *use_vmsplice, unsigned int flags) {
-	if (*use_vmsplice) {
-		struct iovec span = {.iov_base = data, .iov_len = length};
-		ssize_t size = vmsplice(fd, &span, 1, flags);
-		if (size > 0) return size;
-		if (size < 0 && errno != ENOSYS && errno != EINVAL &&
-		    errno != EPERM && errno != EOPNOTSUPP) return -1;
-		*use_vmsplice = false;
-	}
-	return write(fd, data, length);
-}
-//==============================================================================================================
-static int send_batch_tail(int fd, struct job *job, size_t sent, bool use_vmsplice) {
-	while (use_vmsplice && sent < job->length) {
-		ssize_t size = send_batch_span(fd, job->input + sent, job->length - sent,
-			&use_vmsplice, 0);
-		if (size < 0) {
-			if (errno == EINTR) continue;
-			return errno;
-		}
-		if (!size) return EIO;
-		sent += (size_t)size;
-	}
-	return write_all(fd, job->input + sent, job->length - sent);
-}
-//==============================================================================================================
-static void transfer_job_io(struct job *job, int input, int output, struct state *ordered){
+static void transfer_job_io(struct job *job, int input, int output){
 	struct pollfd fds[] = {
 		{.fd = input, .events = POLLOUT},
 		{.fd = output, .events = POLLIN}
 	};
 	size_t sent = 0;
-	bool use_vmsplice = job->mapped_input != 0;
 	size_t capacity = 0;
 	char buffer[65536];
 
 	while (fds[0].fd >= 0 || fds[1].fd >= 0) {
-		if (ordered && fds[1].fd >= 0) {
-			pthread_mutex_lock(&ordered->lock);
-			bool is_first = ordered->output_head == job;
-			if (is_first) publish_job_stdout(ordered, job, fds[1].fd);
-			pthread_mutex_unlock(&ordered->lock);
-
-			if (is_first) {
-				if (fds[0].fd >= 0) {
-					if (fcntl(input, F_SETFL, 0) < 0) die("set command stdin blocking", errno);
-					int error = send_batch_tail(input, job, sent, use_vmsplice);
-					close(input);
-					if (error != EPIPE) check(error, "write command stdin");
-				}
-				return;
-			}
-
-		}
 		if (poll(fds, 2, -1) < 0) {
 			if (errno == EINTR) continue;
 			die("poll command pipes", errno);
@@ -191,9 +144,8 @@ static void transfer_job_io(struct job *job, int input, int output, struct state
 
 		if (fds[0].revents) {
 			size_t remaining = job->length - sent;
-			size_t chunk = use_vmsplice || remaining < sizeof buffer ? remaining : sizeof buffer;
-			ssize_t size = send_batch_span(fds[0].fd, job->input + sent, chunk,
-				&use_vmsplice, SPLICE_F_NONBLOCK);
+			size_t chunk = remaining < sizeof buffer ? remaining : sizeof buffer;
+			ssize_t size = write(fds[0].fd, job->input + sent, chunk);
 			if (size > 0) {
 				sent += (size_t)size;
 				if (sent == job->length) close_poll_fd(&fds[0]);
@@ -273,7 +225,7 @@ struct input_feeder {
 	struct job *job;
 	int fd;
 };
-//==============================================================================================================
+
 static void *feed_blocks(void *argument) {
 	struct input_feeder *feed = argument;
 	struct job *job = feed->job;
@@ -303,7 +255,7 @@ static void *feed_blocks(void *argument) {
 	if (fd >= 0) close(fd);
 	return NULL;
 }
-//==============================================================================================================
+
 static void drain_ordered_job(struct state *state, struct job *job, int output) {
 	char buffer[65536];
 	size_t capacity = 0;
@@ -323,7 +275,6 @@ static void drain_ordered_job(struct state *state, struct job *job, int output) 
 	}
 	close(output);
 }
-//==============================================================================================================
 static bool run_job(struct job *job, struct state *state, const posix_spawnattr_t *attributes) {
 	char **command = state->command;
 	pid_t child;
@@ -357,7 +308,7 @@ static bool run_job(struct job *job, struct state *state, const posix_spawnattr_
 		close(input);
 		if (error != EPIPE) check(error, "write command stdin");
 	} else {
-		transfer_job_io(job, input, output, state->ordered ? state : NULL);
+		transfer_job_io(job, input, output);
 	}
 
 	return wait_command(child, command[0], true);
@@ -591,9 +542,7 @@ static void *worker(void *argument) {
 			pthread_cond_destroy(&job->input_ready);
 			pthread_mutex_destroy(&job->input_lock);
 		}
-		// Downstream pipes can retain these pages after the child exits.
-		if (job->mapped_input) munmap(job->input, job->mapped_input);
-		else free(job->input);
+		free(job->input);
 
 		pthread_mutex_lock(&state->lock);
 		state->failed |= !success;
@@ -697,7 +646,7 @@ static bool refill_batch_reader(struct batch_reader *reader) {
 	reader->length = (size_t)size;
 	return true;
 }
-//==============================================================================================================
+
 static void queue_batch_blocks(struct job *job,
 			       struct batch_reader *reader, size_t lines) {
 	while (lines && refill_batch_reader(reader)) {
@@ -734,7 +683,7 @@ static void queue_batch_blocks(struct job *job,
 	pthread_cond_signal(&job->input_ready);
 	pthread_mutex_unlock(&job->input_lock);
 }
-//==============================================================================================================
+
 static struct job *next_incremental_batch(struct batch_reader *reader) {
 	if (!refill_batch_reader(reader)) return NULL;
 	struct job *job = calloc(1, sizeof *job);
@@ -745,57 +694,12 @@ static struct job *next_incremental_batch(struct batch_reader *reader) {
 	return job;
 }
 //==============================================================================================================
-static void append_batch_input(struct job *job, size_t *capacity, const char *data,
-			       size_t size, bool ordered) {
-	if (size > SIZE_MAX - job->length) die("input batch too large", EOVERFLOW);
-	size_t required = job->length + size;
-	if (!ordered || required < 256 * 1024) {
-		append_bytes(&job->input, &job->length, capacity, data, size);
-		return;
-	}
-
-	if (required > job->mapped_input) {
-		size_t grown = job->mapped_input <= SIZE_MAX / 2 ? job->mapped_input * 2 : SIZE_MAX;
-		if (grown < required) grown = required;
-		char *buffer;
-		if (job->mapped_input) {
-			buffer = mremap(job->input, job->mapped_input, grown, MREMAP_MAYMOVE);
-		} else {
-			buffer = mmap(NULL, grown, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-			if (buffer != MAP_FAILED) {
-				if (job->length) memcpy(buffer, job->input, job->length);
-				free(job->input);
-			}
-		}
-		if (buffer == MAP_FAILED) die("allocate mapped input batch", errno);
-		job->input = buffer;
-		job->mapped_input = grown;
-	}
-
-	memcpy(job->input + job->length, data, size);
-	job->length = required;
-}
-//==============================================================================================================
-static struct job *read_batch(size_t lines, struct batch_reader *reader, bool ordered) {
+static struct job *read_batch(size_t lines, struct batch_reader *reader) {
 	struct job *job = calloc(1, sizeof *job);
 	if (!job) die("allocate job", errno);
 
 	size_t capacity = 0;
-	while (lines) {
-		if (reader->offset == reader->length) {
-			ssize_t size;
-			do {
-				size = read(STDIN_FILENO, reader->buffer, sizeof reader->buffer);
-			} while (size < 0 && errno == EINTR);
-			if (size <= 0) {
-				reader->eof = true;
-				if (size < 0) reader->error = errno;
-				break;
-			}
-			reader->offset = 0;
-			reader->length = (size_t)size;
-		}
-
+	while (lines && refill_batch_reader(reader)) {
 		const char *start = reader->buffer + reader->offset;
 		const char *end = reader->buffer + reader->length;
 		const char *cursor = start;
@@ -809,7 +713,7 @@ static struct job *read_batch(size_t lines, struct batch_reader *reader, bool or
 			--lines;
 		}
 		size_t length = (size_t)(cursor - start);
-		append_batch_input(job, &capacity, start, length, ordered);
+		append_bytes(&job->input, &job->length, &capacity, start, length);
 		reader->offset += length;
 	}
 
@@ -881,7 +785,6 @@ static void usage(FILE *stream) {
 		"  -j N  Concurrent jobs (default: core_count)\n"
 		"  -L N  Input lines per job (default: 1)\n"
 		"  -o    Emit job output in input order, feeding batches as they arrive\n"
-		"        Set XPIPES_EARLY_INPUT=0 to buffer complete batches before dispatch\n"
 		"  -w    Reuse command processes and merge complete stdout lines\n"
 		"  -w -o Split input into contiguous partitions and stream their outputs in order\n"
 		"        Requires a regular file on stdin and ignores -L\n", stream);
@@ -949,9 +852,7 @@ int main(int argc, char **argv) {
 	}
 
 	struct batch_reader reader = {0};
-	const char *early_input = getenv("XPIPES_EARLY_INPUT");
-	bool incremental = state.ordered && !persistent &&
-		(!early_input || strcmp(early_input, "0") != 0);
+	bool incremental = state.ordered && !persistent;
 	struct partitions parts = {0};
 	struct job *job;
 	if (persistent) {
@@ -959,7 +860,7 @@ int main(int argc, char **argv) {
 		state.partition_fd = STDIN_FILENO;
 		job = next_partition(&parts);
 	} else {
-		job = incremental ? next_incremental_batch(&reader) : read_batch(lines, &reader, state.ordered);
+		job = incremental ? next_incremental_batch(&reader) : read_batch(lines, &reader);
 	}
 	if (!job && !reader.error) {
 		posix_spawnattr_destroy(&attributes);
@@ -994,7 +895,7 @@ int main(int argc, char **argv) {
 			queue_batch_blocks(job, &reader, lines);
 			job = next_incremental_batch(&reader);
 		} else if (persistent) job = next_partition(&parts);
-		else job = reader.eof ? NULL : read_batch(lines, &reader, state.ordered);
+		else job = reader.eof ? NULL : read_batch(lines, &reader);
 	}
 
 	pthread_mutex_lock(&state.lock);
