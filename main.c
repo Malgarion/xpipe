@@ -235,20 +235,29 @@ static void *feed_blocks(void *argument) {
 	for (;;) {
 		while (!job->block_head && !job->input_done)
 			pthread_cond_wait(&job->input_ready, &job->input_lock);
+
 		struct input_block *block = job->block_head;
 		if (!block) break;
-		job->block_head = block->next;
-		if (!job->block_head) job->block_tail = NULL;
+
+		job->block_head = NULL;
+		job->block_tail = NULL;
 		pthread_mutex_unlock(&job->input_lock);
 
-		if (fd >= 0) {
-			int error = write_all(fd, block->data, block->length);
-			if (error == EPIPE) {
-				close(fd);
-				fd = -1;
-			} else check(error, "write command stdin");
+		while (block) {
+			struct input_block *next = block->next;
+
+			if (fd >= 0) {
+				int error = write_all(fd, block->data, block->length);
+				if (error == EPIPE) {
+					close(fd);
+					fd = -1;
+				} else check(error, "write command stdin");
+			}
+
+			free(block);
+			block = next;
 		}
-		free(block);
+
 		pthread_mutex_lock(&job->input_lock);
 	}
 	pthread_mutex_unlock(&job->input_lock);
